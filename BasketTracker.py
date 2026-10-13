@@ -48,7 +48,6 @@ def init_db():
     if conn:
         try:
             cur = conn.cursor()
-            # Tabla de Usuarios
             cur.execute("""
                 CREATE TABLE IF NOT EXISTS usuarios (
                     id SERIAL PRIMARY KEY,
@@ -58,7 +57,6 @@ def init_db():
                     creado_en TIMESTAMP DEFAULT CURRENT_TIMESTAMP
                 );
             """)
-            # Tabla de Partidos
             cur.execute("""
                 CREATE TABLE IF NOT EXISTS partidos (
                     id SERIAL PRIMARY KEY,
@@ -84,7 +82,7 @@ init_db()
 
 
 # =========================================================
-# 5. FUNCIONES AUXILIARES: SUMA Y PROMEDIO DE TIEMPOS (HH:MM:SS)
+# 5. FUNCIONES AUXILIARES: MOTOR FINANCIERO RETROACTIVO (v2.5.0)
 # =========================================================
 def sumar_tiempos(lista_tiempos):
     total_segundos = 0
@@ -99,7 +97,7 @@ def sumar_tiempos(lista_tiempos):
             elif len(partes) == 2:  # MM:SS
                 m, s = map(int, partes)
                 total_segundos += m * 60 + s
-            elif len(partes) == 1 and partes[0].isdigit():  # Minutos sueltos
+            elif len(partes) == 1 and partes[0].isdigit():
                 total_segundos += int(partes[0]) * 60
         except ValueError:
             continue
@@ -111,6 +109,33 @@ def formatear_segundos(total_segundos):
     minutos = (total_segundos % 3600) // 60
     segundos = total_segundos % 60
     return f"{horas:02d}h {minutos:02d}m {segundos:02d}s"
+
+
+def obtener_tarifa_unitaria(cant_partidos):
+    """Regla de tramos estricta: 1-11 ($6.00), 12-14 ($6.50), 15-29 ($7.00), 30+ ($8.00)"""
+    if cant_partidos <= 11:
+        return 6.00
+    elif cant_partidos <= 14:
+        return 6.50
+    elif cant_partidos <= 29:
+        return 7.00
+    else:
+        return 8.00
+
+
+def calcular_monto_quincenal_retroactivo(cant_partidos):
+    """
+    MOTOR RETROACTIVO (v2.5.0):
+    Cuando la quincena alcanza un tramo, TODOS los partidos de esa quincena
+    se recalculan a la tarifa del tramo alcanzado.
+      - 1-11 partidos  → todos a $6.00
+      - 12-14 partidos → todos a $6.50
+      - 15-29 partidos → todos a $7.00
+      - 30+ partidos   → todos a $8.00
+    """
+    tarifa_uni = obtener_tarifa_unitaria(cant_partidos)
+    total_monto = float(cant_partidos) * float(tarifa_uni)
+    return total_monto, tarifa_uni
 
 
 # =========================================================
@@ -132,7 +157,7 @@ def registrar_usuario(username, nombre, password):
             conn.commit()
             cur.close()
             conn.close()
-            return True, "✅ Usuario registrado exitosamente. Ya puedes iniciar sesión."
+            return True, "✅ Usuario registrado exitosamente."
         except psycopg2.IntegrityError:
             return False, "⚠️ El nombre de usuario ya existe."
         except Exception as e:
@@ -164,7 +189,7 @@ def autenticar_usuario(username, password):
 
 
 # =========================================================
-# 7. TABULADOR DE TARIFAS ESCALONADAS POR QUINCENA
+# 7. RANGOS Y CONTEO HISTÓRICO
 # =========================================================
 def obtener_rango_quincena(fecha_ref):
     if fecha_ref.day <= 15:
@@ -179,7 +204,7 @@ def obtener_rango_quincena(fecha_ref):
     return inicio_q, fin_q
 
 
-def calcular_tarifa_quincenal(usuario_id, fecha_ref):
+def obtener_conteo_quincena_por_fecha(usuario_id, fecha_ref):
     inicio_q, fin_q = obtener_rango_quincena(fecha_ref)
     conn = get_db_connection()
     conteo = 0
@@ -198,18 +223,7 @@ def calcular_tarifa_quincenal(usuario_id, fecha_ref):
             conn.close()
         except Exception as e:
             st.error(f"Error al calcular conteo quincenal: {e}")
-
-    siguiente_numero = conteo + 1
-
-    # Reglas del Tabulador
-    if siguiente_numero <= 11:
-        return 6.00, siguiente_numero
-    elif siguiente_numero <= 14:
-        return 6.50, siguiente_numero
-    elif siguiente_numero <= 29:
-        return 7.00, siguiente_numero
-    else:
-        return 8.00, siguiente_numero
+    return conteo
 
 
 # =========================================================
@@ -224,7 +238,7 @@ def cargar_partidos(usuario_id):
             SELECT id, codigo_partido, fecha, tiempo_ejecucion, tarifa, creado_en 
             FROM partidos 
             WHERE usuario_id = %s 
-            ORDER BY fecha DESC, id DESC;
+            ORDER BY fecha ASC, id ASC;
         """
         df = pd.read_sql_query(query, conn, params=(usuario_id,))
         conn.close()
@@ -281,7 +295,30 @@ def eliminar_partido(id_partido, usuario_id):
 
 
 # =========================================================
-# 9. MANEJO DE ESTADO DE SESIÓN
+# 9. FUNCIÓN CLAVE: APLICAR TARIFA RETROACTIVA POR QUINCENA
+# =========================================================
+def aplicar_tarifas_retroactivas(df):
+    """
+    Toma un DataFrame de partidos y agrega la columna 'tarifa_efectiva'.
+    MODELO RETROACTIVO: todos los partidos de una misma quincena usan
+    la tarifa del tramo ALCANZADO por el total de partidos de esa quincena.
+    """
+    if df.empty:
+        df["tarifa_efectiva"] = []
+        return df
+
+    df = df.copy()
+    df["quincena_key"] = df["fecha"].apply(
+        lambda f: (f.year, f.month, 1 if f.day <= 15 else 2)
+    )
+    # Contar partidos por quincena y asignar tarifa correspondiente a TODOS
+    conteos = df.groupby("quincena_key")["id"].transform("count")
+    df["tarifa_efectiva"] = conteos.apply(obtener_tarifa_unitaria)
+    return df
+
+
+# =========================================================
+# 10. MANEJO DE ESTADO DE SESIÓN
 # =========================================================
 if "authenticated" not in st.session_state:
     st.session_state.authenticated = False
@@ -289,7 +326,7 @@ if "user_info" not in st.session_state:
     st.session_state.user_info = None
 
 # =========================================================
-# VISTA 1: INICIO DE SESIÓN Y REGISTRO DE USUARIOS
+# VISTA 1: INICIO DE SESIÓN Y REGISTRO
 # =========================================================
 if not st.session_state.authenticated:
     st.title("🏀 BasketTracker Cloud")
@@ -368,8 +405,13 @@ else:
 
     df_todos = cargar_partidos(user_id)
 
+    # Aplicar tarifas retroactivas sobre el histórico completo
+    if not df_todos.empty:
+        df_todos = aplicar_tarifas_retroactivas(df_todos)
+
     if not df_todos.empty:
         today = date.today()
+        fecha_ref_historica = df_todos["fecha"].max()
 
         if periodo == "Hoy":
             df_filtrado = df_todos[df_todos["fecha"] == today]
@@ -377,52 +419,84 @@ else:
             inicio_semana = today - timedelta(days=today.weekday())
             df_filtrado = df_todos[df_todos["fecha"] >= inicio_semana]
         elif periodo == "Esta Quincena":
-            inicio_q, fin_q = obtener_rango_quincena(today)
+            inicio_q, fin_q = obtener_rango_quincena(fecha_ref_historica)
             df_filtrado = df_todos[
                 (df_todos["fecha"] >= inicio_q) & (df_todos["fecha"] <= fin_q)
             ]
         elif periodo == "Este Mes":
-            inicio_mes = date(today.year, today.month, 1)
+            inicio_mes = date(fecha_ref_historica.year, fecha_ref_historica.month, 1)
             df_filtrado = df_todos[df_todos["fecha"] >= inicio_mes]
         else:
             df_filtrado = df_todos.copy()
     else:
         df_filtrado = pd.DataFrame()
+        fecha_ref_historica = date.today()
 
-    st.title("🏀 BasketTracker Cloud v1.3.0")
+    st.title("🏀 BasketTracker Cloud v2.5.0")
     st.caption(f"Panel de Trabajo | Operador: {user_name}")
 
-    # Cálculo automático de tarifa sugerida
-    tarifa_sugerida, num_partido_q = calcular_tarifa_quincenal(user_id, date.today())
+    # =========================================================
+    # FORMULARIO DE REGISTRO
+    # =========================================================
+    st.subheader("➕ Registrar Nuevo Partido")
+
+    col_f_fecha, col_f_id, col_f_tiempo = st.columns([2, 2, 2])
+    with col_f_fecha:
+        fecha_input = st.date_input("Fecha del Partido", value=date.today())
+    with col_f_id:
+        codigo_input = st.text_input("ID / Código del Partido", placeholder="Ej: 1042")
+    with col_f_tiempo:
+        tiempo_input = st.text_input("Tiempo de Ejecución", placeholder="HH:MM:SS (Ej: 02:20:00)")
+
+    conteo_quincena_form = obtener_conteo_quincena_por_fecha(user_id, fecha_input)
+    siguiente_numero = conteo_quincena_form + 1
+    tarifa_sugerida = obtener_tarifa_unitaria(siguiente_numero)
 
     st.info(
-        f"💡 **Tabulador Quincenal:** Registrarás el **Partido #{num_partido_q}** de la quincena. "
-        f"Siguiente tarifa sugerida: **${tarifa_sugerida:.2f}** "
+        f"💡 **Tabulador Quincenal Retroactivo (v2.5.0):** Para la fecha seleccionada ({fecha_input}), "
+        f"registrarás el **Partido #{siguiente_numero}** de su quincena. "
+        f"Al guardarlo, TODOS los partidos de esa quincena se recalcularán a la tarifa del tramo alcanzado: "
+        f"**${tarifa_sugerida:.2f}** "
         f"*(1-11: $6.00 | 12-14: $6.50 | 15-29: $7.00 | 30+: $8.00)*"
     )
 
+    if st.button("💾 Guardar Partido en la Base de Datos", use_container_width=True):
+        if not codigo_input.strip():
+            st.warning("⚠️ Debe ingresar el ID o Código del Partido.")
+        else:
+            if guardar_partido(
+                user_id,
+                codigo_input.strip(),
+                fecha_input,
+                tiempo_input.strip(),
+                tarifa_sugerida,
+            ):
+                st.success(f"✅ Partido '{codigo_input}' guardado con éxito.")
+                st.rerun()
+
+    st.markdown("---")
+
     # ---------------------------------------------------------
-    # 📌 PIZARRAS DE TOTALES, TIEMPO Y PROMEDIOS (KPIs)
+    # 📌 CÁLCULO DE MÉTRICAS Y TOTALES RETROACTIVOS
     # ---------------------------------------------------------
     cant_partidos = len(df_filtrado)
-    total_cobrar = (
-        float(df_filtrado["tarifa"].sum()) if not df_filtrado.empty else 0.00
-    )
-    
+
+    if not df_filtrado.empty:
+        total_cobrar = float(df_filtrado["tarifa_efectiva"].sum())
+    else:
+        total_cobrar = 0.00
+
     total_segundos = (
         sumar_tiempos(df_filtrado["tiempo_ejecucion"].tolist())
         if not df_filtrado.empty
         else 0
     )
-    
     tiempo_total_str = formatear_segundos(total_segundos)
 
-    # Cálculo del promedio por partido
     if cant_partidos > 0:
         promedio_segundos = total_segundos // cant_partidos
     else:
         promedio_segundos = 0
-    
     promedio_tiempo_str = formatear_segundos(promedio_segundos)
 
     # Renderizado en 4 columnas de métricas superiores
@@ -430,62 +504,23 @@ else:
     col_kpi1.metric("🏀 Partidos", f"{cant_partidos} juegos")
     col_kpi2.metric("⏱️ Tiempo Total", tiempo_total_str)
     col_kpi3.metric("📊 Promedio / Juego", promedio_tiempo_str)
-    col_kpi4.metric("💵 Total Quincena", f"${total_cobrar:.2f}")
-
-    st.markdown("---")
-
-    # ---------------------------------------------------------
-    # FORMULARIO DE REGISTRO
-    # ---------------------------------------------------------
-    st.subheader("➕ Registrar Nuevo Partido")
-    with st.form("form_registro_partido", clear_on_submit=True):
-        col_f1, col_f2, col_f3, col_f4 = st.columns([2, 2, 2, 2])
-
-        with col_f1:
-            codigo_input = st.text_input(
-                "ID del Partido (Número/Código)", placeholder="Ej: 1042"
-            )
-        with col_f2:
-            fecha_input = st.date_input("Fecha", value=date.today())
-        with col_f3:
-            tiempo_input = st.text_input(
-                "Tiempo en hacerlo", placeholder="HH:MM:SS (Ej: 02:20:00)"
-            )
-        with col_f4:
-            tarifa_input = st.number_input(
-                "Tarifa ($)",
-                value=tarifa_sugerida,
-                min_value=0.0,
-                step=0.50,
-                format="%.2f",
-            )
-
-        submit_btn = st.form_submit_button(
-            "💾 Guardar Partido", use_container_width=True
-        )
-
-        if submit_btn:
-            if not codigo_input.strip():
-                st.warning("⚠️ Debe ingresar el ID o Código del Partido.")
-            else:
-                if guardar_partido(
-                    user_id,
-                    codigo_input.strip(),
-                    fecha_input,
-                    tiempo_input.strip(),
-                    tarifa_input,
-                ):
-                    st.success(f"✅ Partido '{codigo_input}' guardado con éxito.")
-                    st.rerun()
+    col_kpi4.metric("💵 Total Período", f"${total_cobrar:.2f}")
 
     st.markdown("---")
     st.subheader(f"📋 Registros Filtrados ({periodo})")
 
     if not df_filtrado.empty:
         df_display = df_filtrado.copy()
-        df_display["tarifa_fmt"] = df_display["tarifa"].apply(
+
+        # La columna tarifa_efectiva ya viene calculada desde aplicar_tarifas_retroactivas
+        df_display["tarifa_fmt"] = df_display["tarifa_efectiva"].apply(
             lambda x: f"${float(x):.2f}"
         )
+
+        # Ordenar para mostrar: fecha descendente, id descendente
+        df_display = df_display.sort_values(
+            ["fecha", "id"], ascending=[False, False]
+        ).reset_index(drop=True)
 
         df_tabla = df_display[[
             "id",
@@ -499,7 +534,7 @@ else:
             "Código / Partido",
             "Fecha",
             "Tiempo de Ejecución",
-            "Tarifa ($)",
+            "Tarifa Unitaria ($)",
         ]
 
         st.dataframe(df_tabla, use_container_width=True, hide_index=True)
@@ -512,13 +547,13 @@ else:
                 "codigo_partido",
                 "fecha",
                 "tiempo_ejecucion",
-                "tarifa",
+                "tarifa_efectiva",
             ]].copy()
             df_export.columns = [
                 "Código Partido",
                 "Fecha",
                 "Tiempo Ejecución",
-                "Tarifa ($)",
+                "Tarifa Unitaria ($)",
             ]
             csv_data = df_export.to_csv(index=False).encode("utf-8")
             filename_periodo = periodo.lower().replace(" ", "_")
