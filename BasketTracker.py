@@ -84,7 +84,7 @@ init_db()
 
 
 # =========================================================
-# 5. FUNCIONES AUXILIARES: SUMA Y PROMEDIO DE TIEMPOS (HH:MM:SS)
+# 5. FUNCIONES AUXILIARES: TIEMPOS Y TARIFA MASIVA
 # =========================================================
 def sumar_tiempos(lista_tiempos):
     total_segundos = 0
@@ -111,6 +111,25 @@ def formatear_segundos(total_segundos):
     minutos = (total_segundos % 3600) // 60
     segundos = total_segundos % 60
     return f"{horas:02d}h {minutos:02d}m {segundos:02d}s"
+
+
+def obtener_tarifa_unitaria(cant_partidos):
+    """Devuelve la tarifa unitaria estricta según el volumen total del periodo"""
+    if cant_partidos <= 11:
+        return 6.00
+    elif cant_partidos <= 14:
+        return 6.50
+    elif cant_partidos <= 29:
+        return 7.00
+    else:
+        return 8.00
+
+
+def calcular_monto_quincenal_masivo(cant_partidos):
+    """Calcula obligatoriamente el monto total multiplicando el volumen por la tarifa del tramo"""
+    tarifa_uni = obtener_tarifa_unitaria(cant_partidos)
+    total_monto = cant_partidos * tarifa_uni
+    return total_monto, tarifa_uni
 
 
 # =========================================================
@@ -164,7 +183,7 @@ def autenticar_usuario(username, password):
 
 
 # =========================================================
-# 7. TABULADOR DE TARIFAS ESCALONADAS POR QUINCENA
+# 7. RANGOS Y CONTEO HISTÓRICO
 # =========================================================
 def obtener_rango_quincena(fecha_ref):
     if fecha_ref.day <= 15:
@@ -177,39 +196,6 @@ def obtener_rango_quincena(fecha_ref):
         else:
             fin_q = date(fecha_ref.year, fecha_ref.month + 1, 1) - timedelta(days=1)
     return inicio_q, fin_q
-
-
-def calcular_tarifa_quincenal(usuario_id, fecha_ref):
-    inicio_q, fin_q = obtener_rango_quincena(fecha_ref)
-    conn = get_db_connection()
-    conteo = 0
-    if conn:
-        try:
-            cur = conn.cursor()
-            cur.execute(
-                """
-                SELECT COUNT(*) FROM partidos 
-                WHERE usuario_id = %s AND fecha >= %s AND fecha <= %s;
-            """,
-                (usuario_id, inicio_q, fin_q),
-            )
-            conteo = cur.fetchone()[0]
-            cur.close()
-            conn.close()
-        except Exception as e:
-            st.error(f"Error al calcular conteo quincenal: {e}")
-
-    siguiente_numero = conteo + 1
-
-    # Reglas del Tabulador
-    if siguiente_numero <= 11:
-        return 6.00, siguiente_numero
-    elif siguiente_numero <= 14:
-        return 6.50, siguiente_numero
-    elif siguiente_numero <= 29:
-        return 7.00, siguiente_numero
-    else:
-        return 8.00, siguiente_numero
 
 
 # =========================================================
@@ -377,52 +363,56 @@ else:
             inicio_semana = today - timedelta(days=today.weekday())
             df_filtrado = df_todos[df_todos["fecha"] >= inicio_semana]
         elif periodo == "Esta Quincena":
-            inicio_q, fin_q = obtener_rango_quincena(today)
+            # FILTRO DINÁMICO CORREGIDO: Toma la fecha del partido más reciente cargado para evaluar la quincena,
+            # asegurando que los datos históricos se visualicen correctamente sin depender exclusivamente de hoy.
+            fecha_referencia = df_todos["fecha"].max() if not df_todos.empty else today
+            inicio_q, fin_q = obtener_rango_quincena(fecha_referencia)
             df_filtrado = df_todos[
                 (df_todos["fecha"] >= inicio_q) & (df_todos["fecha"] <= fin_q)
             ]
         elif periodo == "Este Mes":
-            inicio_mes = date(today.year, today.month, 1)
+            fecha_referencia = df_todos["fecha"].max() if not df_todos.empty else today
+            inicio_mes = date(fecha_referencia.year, fecha_referencia.month, 1)
             df_filtrado = df_todos[df_todos["fecha"] >= inicio_mes]
         else:
             df_filtrado = df_todos.copy()
     else:
         df_filtrado = pd.DataFrame()
 
-    st.title("🏀 BasketTracker Cloud v1.3.0")
+    st.title("🏀 BasketTracker Cloud v2.0.0")
     st.caption(f"Panel de Trabajo | Operador: {user_name}")
 
-    # Cálculo automático de tarifa sugerida
-    tarifa_sugerida, num_partido_q = calcular_tarifa_quincenal(user_id, date.today())
+    # Cálculo dinámico basado en los datos cargados
+    conteo_actual = len(df_filtrado) if periodo == "Esta Quincena" else len(df_todos)
+    tarifa_sugerida = obtener_tarifa_unitaria(conteo_actual + 1)
 
     st.info(
-        f"💡 **Tabulador Quincenal:** Registrarás el **Partido #{num_partido_q}** de la quincena. "
-        f"Siguiente tarifa sugerida: **${tarifa_sugerida:.2f}** "
+        f"💡 **Tabulador Quincenal Inteligente (v2.0.0):** El sistema analiza tus fechas cargadas. "
+        f"Tarifa unitaria recomendada para el lote actual: **${tarifa_sugerida:.2f}** "
         f"*(1-11: $6.00 | 12-14: $6.50 | 15-29: $7.00 | 30+: $8.00)*"
     )
 
     # ---------------------------------------------------------
-    # 📌 PIZARRAS DE TOTALES, TIEMPO Y PROMEDIOS (KPIs)
+    # 📌 CÁLCULO DE MÉTRICAS Y TOTALES MASIVOS
     # ---------------------------------------------------------
     cant_partidos = len(df_filtrado)
-    total_cobrar = (
-        float(df_filtrado["tarifa"].sum()) if not df_filtrado.empty else 0.00
-    )
-    
+
+    if periodo == "Esta Quincena" and not df_filtrado.empty:
+        total_cobrar, tarifa_vigente_lote = calcular_monto_quincenal_masivo(cant_partidos)
+    else:
+        total_cobrar = float(df_filtrado["tarifa"].sum()) if not df_filtrado.empty else 0.00
+
     total_segundos = (
         sumar_tiempos(df_filtrado["tiempo_ejecucion"].tolist())
         if not df_filtrado.empty
         else 0
     )
-    
     tiempo_total_str = formatear_segundos(total_segundos)
 
-    # Cálculo del promedio por partido
     if cant_partidos > 0:
         promedio_segundos = total_segundos // cant_partidos
     else:
         promedio_segundos = 0
-    
     promedio_tiempo_str = formatear_segundos(promedio_segundos)
 
     # Renderizado en 4 columnas de métricas superiores
@@ -483,7 +473,14 @@ else:
 
     if not df_filtrado.empty:
         df_display = df_filtrado.copy()
-        df_display["tarifa_fmt"] = df_display["tarifa"].apply(
+        
+        if periodo == "Esta Quincena":
+            tarifa_actual_lote = obtener_tarifa_unitaria(len(df_display))
+            df_display["tarifa_efectiva"] = tarifa_actual_lote
+        else:
+            df_display["tarifa_efectiva"] = df_display["tarifa"]
+
+        df_display["tarifa_fmt"] = df_display["tarifa_efectiva"].apply(
             lambda x: f"${float(x):.2f}"
         )
 
@@ -499,7 +496,7 @@ else:
             "Código / Partido",
             "Fecha",
             "Tiempo de Ejecución",
-            "Tarifa ($)",
+            "Tarifa Unitaria ($)",
         ]
 
         st.dataframe(df_tabla, use_container_width=True, hide_index=True)
@@ -512,13 +509,13 @@ else:
                 "codigo_partido",
                 "fecha",
                 "tiempo_ejecucion",
-                "tarifa",
+                "tarifa_efectiva",
             ]].copy()
             df_export.columns = [
                 "Código Partido",
                 "Fecha",
                 "Tiempo Ejecución",
-                "Tarifa ($)",
+                "Tarifa Unitaria ($)",
             ]
             csv_data = df_export.to_csv(index=False).encode("utf-8")
             filename_periodo = periodo.lower().replace(" ", "_")
@@ -541,14 +538,4 @@ else:
                     for _, row in df_filtrado.iterrows()
                 }
                 partido_sel = st.selectbox(
-                    "Seleccione el registro a eliminar:",
-                    options=list(opciones_eliminar.keys()),
-                )
-
-                if st.button("🔴 Eliminar Registro Seleccionado"):
-                    id_a_borrar = opciones_eliminar[partido_sel]
-                    if eliminar_partido(id_a_borrar, user_id):
-                        st.success("Registro eliminado correctamente.")
-                        st.rerun()
-    else:
-        st.info(f"ℹ️ No hay partidos registrados en el período: {periodo}")
+                    "Seleccione el registro a eliminar
