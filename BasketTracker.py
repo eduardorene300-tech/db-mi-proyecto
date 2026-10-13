@@ -48,7 +48,6 @@ def init_db():
     if conn:
         try:
             cur = conn.cursor()
-            # Tabla de Usuarios
             cur.execute("""
                 CREATE TABLE IF NOT EXISTS usuarios (
                     id SERIAL PRIMARY KEY,
@@ -58,7 +57,6 @@ def init_db():
                     creado_en TIMESTAMP DEFAULT CURRENT_TIMESTAMP
                 );
             """)
-            # Tabla de Partidos
             cur.execute("""
                 CREATE TABLE IF NOT EXISTS partidos (
                     id SERIAL PRIMARY KEY,
@@ -179,7 +177,20 @@ def obtener_rango_quincena(fecha_ref):
     return inicio_q, fin_q
 
 
+def tarifa_por_cantidad(cant_partidos):
+    """Tarifa unitaria del tramo: 1-11 ($6.00), 12-14 ($6.50), 15-29 ($7.00), 30+ ($8.00)."""
+    if cant_partidos <= 11:
+        return 6.00
+    elif cant_partidos <= 14:
+        return 6.50
+    elif cant_partidos <= 29:
+        return 7.00
+    else:
+        return 8.00
+
+
 def calcular_tarifa_quincenal(usuario_id, fecha_ref):
+    """Devuelve (tarifa_sugerida_para_el_próximo, número_del_próximo)."""
     inicio_q, fin_q = obtener_rango_quincena(fecha_ref)
     conn = get_db_connection()
     conteo = 0
@@ -200,16 +211,7 @@ def calcular_tarifa_quincenal(usuario_id, fecha_ref):
             st.error(f"Error al calcular conteo quincenal: {e}")
 
     siguiente_numero = conteo + 1
-
-    # Reglas del Tabulador
-    if siguiente_numero <= 11:
-        return 6.00, siguiente_numero
-    elif siguiente_numero <= 14:
-        return 6.50, siguiente_numero
-    elif siguiente_numero <= 29:
-        return 7.00, siguiente_numero
-    else:
-        return 8.00, siguiente_numero
+    return tarifa_por_cantidad(siguiente_numero), siguiente_numero
 
 
 # =========================================================
@@ -278,6 +280,27 @@ def eliminar_partido(id_partido, usuario_id):
             st.error(f"Error al eliminar registro: {e}")
             return False
     return False
+
+
+def aplicar_tarifa_retroactiva(df):
+    """
+    Agrega 'tarifa_efectiva' al DataFrame aplicando el modelo RETROACTIVO:
+    todos los partidos de una misma quincena usan la tarifa del tramo
+    ALCANZADO por la cantidad total de partidos de esa quincena.
+    """
+    if df.empty:
+        df = df.copy()
+        df["tarifa_efectiva"] = []
+        return df
+
+    df = df.copy()
+    df["_qk"] = df["fecha"].apply(
+        lambda f: (f.year, f.month, 1 if f.day <= 15 else 2)
+    )
+    conteos = df.groupby("_qk")["id"].transform("count")
+    df["tarifa_efectiva"] = conteos.apply(tarifa_por_cantidad)
+    df = df.drop(columns=["_qk"])
+    return df
 
 
 # =========================================================
@@ -368,6 +391,10 @@ else:
 
     df_todos = cargar_partidos(user_id)
 
+    # Aplicar tarifa retroactiva sobre el histórico completo
+    if not df_todos.empty:
+        df_todos = aplicar_tarifa_retroactiva(df_todos)
+
     if not df_todos.empty:
         today = date.today()
 
@@ -389,7 +416,7 @@ else:
     else:
         df_filtrado = pd.DataFrame()
 
-    st.title("🏀 BasketTracker Cloud v1.3.0")
+    st.title("🏀 BasketTracker Cloud v1.3.1")
     st.caption(f"Panel de Trabajo | Operador: {user_name}")
 
     # Cálculo automático de tarifa sugerida
@@ -405,27 +432,28 @@ else:
     # 📌 PIZARRAS DE TOTALES, TIEMPO Y PROMEDIOS (KPIs)
     # ---------------------------------------------------------
     cant_partidos = len(df_filtrado)
-    total_cobrar = (
-        float(df_filtrado["tarifa"].sum()) if not df_filtrado.empty else 0.00
-    )
-    
+
+    # TOTAL RETROACTIVO: usa 'tarifa_efectiva' (recalculada por quincena)
+    if not df_filtrado.empty and "tarifa_efectiva" in df_filtrado.columns:
+        total_cobrar = float(df_filtrado["tarifa_efectiva"].sum())
+    else:
+        total_cobrar = 0.00
+
     total_segundos = (
         sumar_tiempos(df_filtrado["tiempo_ejecucion"].tolist())
         if not df_filtrado.empty
         else 0
     )
-    
+
     tiempo_total_str = formatear_segundos(total_segundos)
 
-    # Cálculo del promedio por partido
     if cant_partidos > 0:
         promedio_segundos = total_segundos // cant_partidos
     else:
         promedio_segundos = 0
-    
+
     promedio_tiempo_str = formatear_segundos(promedio_segundos)
 
-    # Renderizado en 4 columnas de métricas superiores
     col_kpi1, col_kpi2, col_kpi3, col_kpi4 = st.columns(4)
     col_kpi1.metric("🏀 Partidos", f"{cant_partidos} juegos")
     col_kpi2.metric("⏱️ Tiempo Total", tiempo_total_str)
@@ -483,9 +511,16 @@ else:
 
     if not df_filtrado.empty:
         df_display = df_filtrado.copy()
-        df_display["tarifa_fmt"] = df_display["tarifa"].apply(
-            lambda x: f"${float(x):.2f}"
-        )
+
+        # Usar tarifa retroactiva si existe
+        if "tarifa_efectiva" in df_display.columns:
+            df_display["tarifa_fmt"] = df_display["tarifa_efectiva"].apply(
+                lambda x: f"${float(x):.2f}"
+            )
+        else:
+            df_display["tarifa_fmt"] = df_display["tarifa"].apply(
+                lambda x: f"${float(x):.2f}"
+            )
 
         df_tabla = df_display[[
             "id",
@@ -508,18 +543,33 @@ else:
 
         # Exportar CSV
         with col_exp1:
-            df_export = df_display[[
-                "codigo_partido",
-                "fecha",
-                "tiempo_ejecucion",
-                "tarifa",
-            ]].copy()
-            df_export.columns = [
-                "Código Partido",
-                "Fecha",
-                "Tiempo Ejecución",
-                "Tarifa ($)",
-            ]
+            if "tarifa_efectiva" in df_display.columns:
+                df_export = df_display[[
+                    "codigo_partido",
+                    "fecha",
+                    "tiempo_ejecucion",
+                    "tarifa_efectiva",
+                ]].copy()
+                df_export.columns = [
+                    "Código Partido",
+                    "Fecha",
+                    "Tiempo Ejecución",
+                    "Tarifa ($)",
+                ]
+            else:
+                df_export = df_display[[
+                    "codigo_partido",
+                    "fecha",
+                    "tiempo_ejecucion",
+                    "tarifa",
+                ]].copy()
+                df_export.columns = [
+                    "Código Partido",
+                    "Fecha",
+                    "Tiempo Ejecución",
+                    "Tarifa ($)",
+                ]
+
             csv_data = df_export.to_csv(index=False).encode("utf-8")
             filename_periodo = periodo.lower().replace(" ", "_")
 
